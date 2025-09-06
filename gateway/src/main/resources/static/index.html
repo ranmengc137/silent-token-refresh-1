@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Silent Refresh (Gateway + Auth + Resource + Spring Security)</title>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; }
+    .row { margin-bottom: 12px; }
+    input { padding: 6px 8px; margin-right: 8px; }
+    button { padding: 8px 12px; }
+    pre { background: #f6f8fa; padding: 12px; border-radius: 8px; max-height: 360px; overflow: auto; }
+    .badge { padding: 2px 6px; border-radius: 6px; background:#e9ecef; margin-left: 6px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Silent Token Refresh + Spring Security Method-Level Protection</h1>
+  <p>Login issues tokens with a <code>roles</code> claim. Resource-service requires <code>ROLE_USER</code> via <code>@PreAuthorize("hasRole('USER')")</code>.</p>
+
+  <div class="row">
+    <label>Username:</label>
+    <input id="username" value="alice" />
+    <label>Password:</label>
+    <input id="password" value="password" type="password" />
+    <button onclick="login()">Login</button>
+    <span class="badge">Access TTL: 20s, Refresh TTL: 5m</span>
+  </div>
+
+  <div class="row">
+    <button onclick="callProtected()">Call /api/data (Client-side refresh)</button>
+    <button onclick="callProtectedServerSide()">Call /api/data (Server-side refresh via Gateway)</button>
+    <button onclick="logout()">Logout</button>
+  </div>
+
+  <div class="row">
+    <strong>Current tokens</strong>
+    <pre id="tokens"></pre>
+  </div>
+
+  <div class="row">
+    <strong>Log</strong>
+    <pre id="log"></pre>
+  </div>
+
+<script>
+const logEl = document.getElementById('log');
+const tokEl = document.getElementById('tokens');
+
+function log(...args) {
+  const line = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  logEl.textContent += `[${new Date().toLocaleTimeString()}] ${line}
+`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function showTokens() {
+  const token = sessionStorage.getItem('token') || '';
+  const tokenExpire = sessionStorage.getItem('tokenExpire') || '';
+  const refreshToken = sessionStorage.getItem('refreshToken') || '';
+  const refreshExpire = sessionStorage.getItem('refreshExpire') || '';
+  tokEl.textContent = JSON.stringify({
+    token: token ? token.substring(0, 25) + '...' : '',
+    tokenExpire,
+    refreshToken: refreshToken ? refreshToken.substring(0, 25) + '...' : '',
+    refreshExpire
+  }, null, 2);
+}
+
+async function login() {
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  const res = await axios.post('/auth/login', { username, password });
+  const data = res.data;
+  sessionStorage.setItem('token', data.token);
+  sessionStorage.setItem('tokenExpire', String(data.tokenExpire));
+  sessionStorage.setItem('refreshToken', data.refreshToken);
+  sessionStorage.setItem('refreshExpire', String(data.refreshExpire));
+  sessionStorage.setItem('isAuthenticated', 'true');
+  log('Logged in. Tokens received.');
+  showTokens();
+  startTimer();
+}
+
+function logout() {
+  sessionStorage.clear();
+  log('Logged out & storage cleared.');
+  showTokens();
+  stopTimer();
+}
+
+const api = axios.create();
+api.interceptors.request.use(cfg => {
+  const token = sessionStorage.getItem('token');
+  if (token) cfg.headers['Authorization'] = 'Bearer ' + token;
+  return cfg;
+});
+
+let isRefreshing = false;
+let queuedRequests = [];
+
+api.interceptors.response.use(
+  res => res,
+  async err => {
+    if (!err.response) throw err;
+    const status = err.response.status;
+
+    if (status === 401) {
+      log('401 -> redirect to login');
+      sessionStorage.clear();
+      showTokens();
+      alert('Session expired or invalid. Please login again.');
+      throw err;
+    }
+
+    if (status === 511) {
+      if (!isRefreshing) {
+        isRefreshing = true;
+        doRefresh()
+          .then(() => {
+            isRefreshing = false;
+            const replays = queuedRequests.slice(); queuedRequests = [];
+            for (const {resolve, cfg} of replays) {
+              cfg.headers['Authorization'] = 'Bearer ' + (sessionStorage.getItem('token') || '');
+              resolve(api(cfg));
+            }
+          })
+          .catch(e => {
+            isRefreshing = false;
+            const rejects = queuedRequests.slice(); queuedRequests = [];
+            for (const {reject} of rejects) reject(e);
+            sessionStorage.clear();
+          });
+      }
+      return new Promise((resolve, reject) => {
+        queuedRequests.push({ resolve, reject, cfg: err.config });
+      });
+    }
+
+    throw err;
+  }
+);
+
+async function doRefresh() {
+  const rt = sessionStorage.getItem('refreshToken');
+  if (!rt) throw new Error('No refresh token');
+  log('Refreshing access token (client-side)...');
+  const res = await axios.get('/auth/refresh', { headers: { Authorization: 'Bearer ' + rt } });
+  const data = res.data;
+  sessionStorage.setItem('token', data.token);
+  sessionStorage.setItem('tokenExpire', String(data.tokenExpire));
+  log('Client-side refresh succeeded.');
+  showTokens();
+}
+
+async function callProtected() {
+  try {
+    const res = await api.get('/api/data');
+    log('Client-side: OK', res.data);
+  } catch (e) {
+    log('Client-side call failed:', e.response ? e.response.status : e.message);
+  }
+}
+
+async function callProtectedServerSide() {
+  try {
+    const token = sessionStorage.getItem('token');
+    const refresh = sessionStorage.getItem('refreshToken');
+    const res = await axios.get('/api/data', {
+      headers: {
+        Authorization: 'Bearer ' + token,
+        'X-Use-Server-Refresh': 'true',
+        'Authorization-Refresh': 'Bearer ' + refresh
+      }
+    });
+    const newToken = res.headers['x-new-token'];
+    if (newToken) {
+      sessionStorage.setItem('token', newToken);
+    }
+    log('Server-side: OK', res.data);
+    showTokens();
+  } catch (e) {
+    log('Server-side call failed:', e.response ? e.response.status : e.message);
+  }
+}
+
+// Proactive timer-based refresh
+let timerId = null;
+function startTimer() {
+  stopTimer();
+  timerId = setInterval(async () => {
+    const tokenExpire = Number(sessionStorage.getItem('tokenExpire') || '0');
+    if (!tokenExpire) return;
+    const remaining = tokenExpire - Date.now();
+    if (remaining <= 30_000) {
+      try {
+        await doRefresh();
+      } catch (e) {
+        log('Proactive refresh failed:', e.message || e);
+      }
+    }
+  }, 10_000);
+  log('Proactive refresh timer started.');
+}
+
+function stopTimer() {
+  if (timerId) clearInterval(timerId);
+  timerId = null;
+  log('Proactive refresh timer stopped.');
+}
+
+showTokens();
+</script>
+</body>
+</html>

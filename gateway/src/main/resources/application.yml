@@ -1,0 +1,23 @@
+server:
+  port: 8080
+
+spring:
+  main:
+    banner-mode: 'off'
+  cloud:
+    gateway:
+      routes:
+        - id: auth
+          uri: http://localhost:8081
+          predicates:
+            - Path=/auth/**
+        - id: data
+          uri: http://localhost:8082
+          predicates:
+            - Path=/api/**
+          filters:
+            - name: Jwt
+      default-filters: []
+
+demo:
+  auth-base: http://localhost:8081
